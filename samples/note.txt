@@ -1,0 +1,2 @@
+Synthetic demo data: Tamil and English rows with stray spaces inside words,
+glued words, single-letter splits, non-breaking spaces and zero-width characters.

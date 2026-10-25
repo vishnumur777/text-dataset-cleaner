@@ -1,0 +1,16 @@
+.venv/
+node_modules/
+frontend/dist/
+frontend/node_modules/
+models/*.gguf
+models/*.part
+.cache/
+.sessions/
+.exports/
+.run/
+.server.log
+.server.pid
+.llama-server.log
+__pycache__/
+*.pyc
+.DS_Store

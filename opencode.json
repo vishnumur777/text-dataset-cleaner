@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "llamacpp/unsloth/Qwen3-1.7B-GGUF:Q4_0",
+  "mcp": {
+    "devrelay": {
+      "type": "local",
+      "command": [
+        "/home/varun/.devrelay/bin/dev_mlh_mcp_server",
+        "--stdio"
+      ]
+    }
+  },
+  "provider": {
+    "llamacpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp local",
+      "options": {
+        "baseURL": "http://127.0.0.1:9931/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "unsloth/Qwen3-1.7B-GGUF:Q4_0": {
+          "name": "Qwen3 1.7B Q4_0",
+          "limit": { "context": 8192, "output": 2048 }
+        }
+      }
+    },
+    "tokenharbor": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Token Harbor",
+      "options": {
+        "baseURL": "https://tokenharbor.ai/v1",
+        "apiKey": "{env:TOKENHARBOR_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4.1-flash:free": {
+          "name": "DeepSeek V4.1 Flash (free)"
+        }
+      }
+    }
+  }
+}
