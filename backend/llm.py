@@ -32,11 +32,14 @@ SYSTEM = (
     "You never add, remove, move or invent a space, and you never split one word "
     "into two or join two words into one; the existing word boundaries are correct "
     "as given. "
+    "You return the whole text, never a summary, never a fragment, and you never "
+    "repeat the input. "
     "You never translate, paraphrase, summarise, or add new information. "
-    "You reply with a single JSON object and nothing else."
+    "You reply with a single JSON object and nothing else, using plain ASCII "
+    "double quotes."
 )
 
-PROMPT = """Fix the spelling mistakes in this dataset cell.
+PROMPT = """Fix the spelling mistakes in the text below.
 
 Rules:
 - Change only letters that are misspelled.
@@ -45,15 +48,16 @@ Rules:
 - Never split a word into two words, and never join two words into one.
 - Keep the language, punctuation, casing, numbers, code and URLs unchanged.
 - Never translate, add or remove sentences.
+- Return the full text, not a fragment, and do not repeat the input.
 
-Examples:
-{{"text": "I downloded the documnet", "cleaned": "I downloaded the document"}}
-{{"text": "this is speling eror", "cleaned": "this is spelling error"}}
+Examples of the reply format:
+{{"cleaned": "I downloaded the document"}}
+{{"cleaned": "this is speling eror"}}
 
-Reply with one JSON object and nothing else: {{"cleaned": "<corrected text>"}}
+Text to fix:
+{text}
 
-Text:
-{text}"""
+Reply with one JSON object and nothing else."""
 
 
 def _http() -> httpx.Client:
@@ -82,6 +86,44 @@ def detect() -> dict[str, Any]:
     return {"provider": None, "url": "", "model": "", "ok": False}
 
 
+def _count_tokens(text: str, provider: dict[str, Any]) -> int:
+    """How many tokens the model needs to read or restate this text.
+
+    ``max_tokens`` used to be derived with ``len(text) * 2 + 120`` characters,
+    which pinned every cell over ~450 chars to the same 1024-token ceiling. A
+    4,580-char Tamil cell needs far more than that just to say the text back, so
+    the answer was truncated before the model ever reached ``"cleaned"``.
+    """
+    if provider.get("provider") == "llama.cpp" and text:
+        try:
+            with _http() as client:
+                r = client.post(f"{provider['url']}/tokenize", json={"content": text}, timeout=20.0)
+                r.raise_for_status()
+                tokens = r.json().get("tokens")
+                if isinstance(tokens, list) and tokens:
+                    return len(tokens)
+        except Exception:
+            pass
+    # Conservative fallback for Ollama or a failed probe: ~3 chars per token.
+    return max(1, int(len(text) / 3.0) + 8)
+
+
+def _context_size(provider: dict[str, Any], default: int = 4096) -> int:
+    """The server's context window, so a cell that cannot fit is reported honestly."""
+    if provider.get("provider") == "llama.cpp":
+        try:
+            with _http() as client:
+                r = client.get(f"{provider['url']}/props", timeout=5.0)
+                r.raise_for_status()
+                props = r.json()
+                n = props.get("default_generation_settings", {}).get("n_ctx") or props.get("n_ctx")
+                if n:
+                    return int(n)
+        except Exception:
+            pass
+    return default
+
+
 def _llama_model() -> str:
     if MODEL_NAME:
         return MODEL_NAME
@@ -91,6 +133,58 @@ def _llama_model() -> str:
         return (data.get("data") or [{}])[0].get("id", "") or "local"
     except Exception:
         return "local"
+
+
+_QUOTES = "\"\u201c\u201d\u2018\u2019'"
+
+
+def _unescape(value: str) -> str:
+    """Turn a JSON string body back into text, even if its escapes are literal."""
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        # The model typed the escapes literally ("\n" instead of a newline).
+        return (
+            value.replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+        )
+
+
+def _scrape_cleaned(raw: str) -> str | None:
+    """Last-resort read of the ``cleaned`` value.
+
+    A 1B model writing Tamil does two things that break ``json.loads``:
+
+    * it closes the JSON string with a curly quote copied from the text itself
+      ("...னர்.”}), which an ASCII-only pattern will not match, and
+    * it simply stops -- ``finish_reason`` is ``stop`` -- leaving the string
+      unterminated (``{"cleaned": "விண்ணை ...``).
+
+    The value is still perfectly good in both cases, so read up to the closing
+    quote (of any flavour) if there is one, otherwise take the rest of the
+    output. The boundary guard downstream restores anything the model dropped.
+    """
+    key = raw.find("cleaned")
+    if key < 0:
+        return None
+    colon = raw.find(":", key)
+    if colon < 0:
+        return None
+    start = colon + 1
+    while start < len(raw) and raw[start] in " \t\r\n":
+        start += 1
+    if start < len(raw) and raw[start] in _QUOTES:
+        start += 1
+    end = re.search(r"[\"\u201c\u201d\u2018\u2019']\s*[,}\]]", raw[start:])
+    if end is not None:
+        value = raw[start : start + end.start()]
+    else:
+        value = re.sub(r"[\s`\]}]+$", "", raw[start:])
+    if not value.strip():
+        return None
+    return _unescape(value)
 
 
 def _extract_json(raw: str) -> dict[str, Any] | None:
@@ -116,7 +210,15 @@ def _extract_json(raw: str) -> dict[str, Any] | None:
     # Recover the fields we need instead of throwing the whole answer away.
     cleaned_match = re.search(r'"cleaned"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, flags=re.S)
     if not cleaned_match:
-        return None
+        cleaned = _scrape_cleaned(raw)
+        if cleaned is None:
+            return None
+        fixes = []
+        for m in re.finditer(
+            r'"before"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"after"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, flags=re.S
+        ):
+            fixes.append({"before": m.group(1), "after": m.group(2), "kind": "space"})
+        return {"cleaned": cleaned, "fixes": fixes, "recovered": True}
     try:
         cleaned = json.loads(f'"{cleaned_match.group(1)}"')
     except Exception:
@@ -182,16 +284,41 @@ def clean_with_llm(
         )
 
     started = time.time()
+    prompt_text = PROMPT.format(text=text)
+    # The model has to restate the whole cell, so the output budget is the length
+    # of the text plus a small margin for the JSON wrapper, and it is bounded by
+    # what is actually left in the context window.
+    prompt_tokens = _count_tokens(SYSTEM + prompt_text, provider)
+    echo_tokens = _count_tokens(text, provider) + 48
+    n_ctx = _context_size(provider)
+    room = n_ctx - prompt_tokens - 16
+    if room < 64:
+        return {
+            "accepted": False,
+            "cleaned": text,
+            "fixes": [],
+            "provider": provider.get("provider", ""),
+            "model": provider.get("model", ""),
+            "elapsed_s": round(time.time() - started, 2),
+            "reason": (
+                f"This cell needs about {prompt_tokens + echo_tokens} tokens, more than the "
+                f"model's {n_ctx}-token window, so it was left to the rule engine. "
+                "Split long cells or raise the server's context size (-c)."
+            ),
+            "boundary_reverted": 0,
+        }
+    out_tokens = max(64, min(echo_tokens, room))
+
     if provider["provider"] == "llama.cpp":
         payload = {
             "model": provider.get("model") or "local",
             "messages": [
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": PROMPT.format(text=text)},
+                {"role": "user", "content": prompt_text},
             ],
             "temperature": 0.0,
             "top_p": 0.9,
-            "max_tokens": min(1024, max(160, len(text) * 2 + 120)),
+            "max_tokens": out_tokens,
             "stream": False,
         }
         url = f"{provider['url']}/v1/chat/completions"
@@ -204,11 +331,11 @@ def clean_with_llm(
             "model": provider.get("model"),
             "messages": [
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": PROMPT.format(text=text)},
+                {"role": "user", "content": prompt_text},
             ],
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0, "num_predict": min(1024, max(160, len(text) * 2 + 120))},
+            "options": {"temperature": 0, "num_predict": out_tokens},
         }
         url = f"{provider['url']}/api/chat"
         with _http() as client:

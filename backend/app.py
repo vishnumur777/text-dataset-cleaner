@@ -146,7 +146,7 @@ class PublishRequest(BaseModel):
 
 def _session_from(loaded, source: dict[str, Any]) -> dict[str, Any]:
     """Create a session from a parsed table and return the file-picker payload."""
-    col = guess_text_column(loaded.df.columns)
+    col = guess_text_column(loaded.df.columns, loaded.df)
     session = store.create(
         loaded.df,
         loaded.fmt,
@@ -282,7 +282,7 @@ def open_sample(name: str):
     if not path.exists():
         raise DataError("That sample no longer exists.", "Open the file picker and upload your own file.", "missing_sample")
     loaded = read_table(str(path))
-    col = guess_text_column(loaded.df.columns)
+    col = guess_text_column(loaded.df.columns, loaded.df)
     session = store.create(
         loaded.df,
         loaded.fmt,
@@ -315,7 +315,7 @@ async def upload(file: UploadFile = File(...)):
         raise DataError("The uploaded file is empty.", "Check the file on disk and upload it again.", "empty_file")
 
     loaded = read_table(str(dest))
-    col = guess_text_column(loaded.df.columns)
+    col = guess_text_column(loaded.df.columns, loaded.df)
     session = store.create(
         loaded.df,
         loaded.fmt or sniff_bytes(file.filename),

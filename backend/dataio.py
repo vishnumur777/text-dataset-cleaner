@@ -183,7 +183,14 @@ def read_table(path: str) -> Loaded:
     return Loaded(df=df, fmt=ext.lstrip("."), truncated=truncated, total_rows=total)
 
 
-def guess_text_column(columns: Iterable[str]) -> str | None:
+def guess_text_column(columns: Iterable[str], df: pd.DataFrame | None = None) -> str | None:
+    """Pick the column that most likely holds the text to clean.
+
+    The hint list only matches English header words ("text", "content", ...), so
+    a dataset whose headers are in another language (a Tamil news corpus, say)
+    falls through. When that happens we fall back to shape rather than names:
+    the free-text column is almost always the longest one by a wide margin.
+    """
     cols = list(columns)
     lowered = {c: c.lower() for c in cols}
     for hint in TEXT_HINTS:
@@ -194,6 +201,30 @@ def guess_text_column(columns: Iterable[str]) -> str | None:
         for col, low in lowered.items():
             if hint in low:
                 return col
+    return _guess_by_length(cols, df)
+
+
+def _guess_by_length(cols: list[str], df: pd.DataFrame | None) -> str | None:
+    """The longest average cell wins, but only when it clearly stands out."""
+    if df is None or len(cols) < 2:
+        return None
+    means: list[tuple[float, str]] = []
+    for col in cols:
+        if col not in df.columns:
+            continue
+        series = df[col].astype(str)
+        if series.empty:
+            continue
+        means.append((float(series.str.len().mean()), col))
+    if not means:
+        return None
+    means.sort(reverse=True)
+    best_len, best_col = means[0]
+    runner_up = means[1][0] if len(means) > 1 else 0.0
+    # A real text column is long in absolute terms and much longer than the
+    # metadata beside it; anything less is a guess we should not make.
+    if best_len >= 120 and best_len >= max(2.0 * runner_up, 40.0):
+        return best_col
     return None
 
 

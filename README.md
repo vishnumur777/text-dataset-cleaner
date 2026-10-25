@@ -54,15 +54,27 @@ FastAPI (Python)
    `downloadthe` still fails to become a word.
 3. **Dynamic program** over token boundaries: keep, merge 2–6 fragments, or split 1 token
    into 2–3 known words. Costs come from unigram frequencies (with an English word list for
-   split candidates and a character trigram model for unknowns).
+   split candidates and a character trigram model for unknowns). For a non-Latin script a
+   split is only trusted when the column itself writes the two parts side by side somewhere
+   else: Tamil is agglutinative, so `பெண்களின்` is *legitimately* `பெண்` + `களின்`, and "both
+   halves are known words" is normal morphology rather than evidence of a glue error. Without
+   that rule a thin column split correct inflected words.
 4. **Model escalation (spelling only)** — Gemma 3 1B receives the *already rule-cleaned*
    text and returns `{"cleaned": "..."}` JSON. Word boundaries are the rule engine's job, so
    the answer is replayed over the rule-cleaned text one edit at a time (`freeze_boundaries`):
    an edit that changes letters inside a word is kept, but adding, removing or moving a space
    is **reverted** — except a space removal whose fused word the lexicon or dictionary knows,
    which lets `down loaded` reach `downloaded`. Deleting or inventing a whole word is
-   reverted too. If the model is offline or malformed, the rule result is used and the UI
-   says so.
+   reverted too, as is an escape sequence the model types into the text (`15\nகிராமம்`). The
+   answer budget is now measured by the model itself — its own tokenizer against the server's
+   context window — instead of guessed from the character count, so a long cell no longer
+   fails just because the reply ran out of room, and a cell that genuinely cannot fit is
+   reported instead of returning nothing. A 1B model can
+   still decline to restate a very long cell; that answer is rejected with the reason shown
+   and the rule result is kept. The parser is
+   tolerant of how a 1B model actually writes Tamil JSON: it reads a value closed with a curly
+   quote (`…னர்.”}"`) and one the model never closed at all. If the model is offline or the
+   answer is malformed, the rule result is used and the UI says so.
 
 ### Cleaning a whole column in one pass
 
@@ -233,8 +245,21 @@ Errors are always `{"error": {"code", "message", "hint"}}` — the UI renders `m
   one-pass job three calls share the CPU and sustain roughly one cell per 5.5 s. It still
   wins because clean rows never reach the model and duplicate cells cost one call.
 * Boundary repair learns from the loaded column, so a 6-row file has far less evidence than a
-  real dataset. The rule engine is at its weakest there; a 1B model cannot decide boundaries
-  for you, so with a thin column expect the diff to miss cases the rules could not see.
+  real dataset. The rule engine is at its weakest there. Two honest consequences, both
+  measured on a 6-row Tamil news parquet: (a) *splitting* a correct inflected word is now
+  prevented — a non-Latin split needs the column to show that boundary elsewhere — but (b)
+  *merging* a stray space inside a word whose whole form the column never saw (`நினை க்கும்`,
+  `காவலர் களால்`) is still missed. We tried two merge rules that looked reasonable (fuse when a
+  part is out-of-vocabulary and the fused form scores no worse; fuse when the second fragment
+  rarely stands alone) and both merged dozens of legitimate word pairs (`ஜனதா கட்சித்` →
+  `ஜனதாகட்சித்`), so we left the gate where evidence, not enthusiasm, draws it. A 1B model
+  cannot decide boundaries for you, so with a thin column expect the diff to miss cases the
+  rules could not see rather than to invent ones it should not have.
+* The model's in-word edits are spelling-only and are *not* grammar-checked. The boundary guard
+  reverts anything that moves a space, but it cannot tell a typo from an inflection: on the
+  same 6-row Tamil parquet Gemma rewrote `மந்தரில்` to `மந்தர்`, dropping a locative ending the
+  guard had no reason to reject. That edit surfaces in the diff precisely so a human can undo
+  it — the tool shows its work instead of pretending to be a grammar checker.
 * Hugging Face publishing needs a write token in `HF_TOKEN`. Kaggle publishing uses the
   connected account and a companion `<slug>-cleaned` dataset, because a Kaggle version
   replaces the whole file list; the source dataset is never modified. `.txt` sources are

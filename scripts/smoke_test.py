@@ -128,6 +128,18 @@ def check_column_guess() -> None:
     check("guesses 'sentence'", guess_text_column(["label", "sentence"]) == "sentence")
     check("returns None when unsure", guess_text_column(["a", "b"]) is None)
 
+    # Headers written in another language miss the English hint list, so the
+    # column that is far longer than everything beside it is the text.
+    df = pd.DataFrame(
+        {
+            "வெளியிட்ட தேதி": ["2026-10-15", "2026-10-16"],
+            "தலைப்பு": ["செய்தி ஒன்று", "செய்தி இரண்டு"],
+            "உள்ளடக்கம்": ["நீண்ட உரை " * 40, "மற்றொரு நீண்ட உரை " * 40],
+        }
+    )
+    check("falls back to the longest column", guess_text_column(list(df.columns), df) == "உள்ளடக்கம்")
+    check("no fallback without a frame", guess_text_column(["a", "b"]) is None)
+
 
 def check_api(base: str) -> None:
     print(f"live API at {base}")
@@ -301,6 +313,27 @@ def check_boundaries() -> None:
         freeze_boundaries("down loaded the file", "downloaded the file", known=model.known)[0]
         == "downloaded the file",
     )
+    check(
+        "reverts a typed newline",
+        freeze_boundaries("ends 15 here", "ends 15\\n here")[0] == "ends 15 here",
+    )
+
+    # Tamil is agglutinative, so a stem with its case ending looks exactly like
+    # two known words glued together. On a small column that made the engine
+    # split the correct "பெண்களின்" into "பெண் களின்"; both halves being known is
+    # normal morphology, not evidence of a glue error.
+    tamil_rows = [
+        "பெண் ஒரு சொல் இங்கே",
+        "பெண் மற்றொரு சொல் அங்கே",
+        "களின் வேறொரு சொல் இங்கே",
+        "களின் மற்றொரு சொல் அங்கே",
+        "பெண்களின் உரிமைகள் பாதுகாக்கப்பட வேண்டும்",
+    ]
+    tamil_model = BoundaryModel(tamil_rows)
+    check(
+        "does not split an inflected tamil word",
+        analyze("பெண்களின் உரிமைகள்", tamil_model)["cleaned"] == "பெண்களின் உரிமைகள்",
+    )
 
 
 def check_job_shape() -> None:
@@ -316,6 +349,33 @@ def check_job_shape() -> None:
     check("percent is byte-accurate", job.snapshot()["percent"] == 50, str(job.snapshot()["percent"]))
 
 
+def check_parser() -> None:
+    """Small models write almost-JSON: curly quotes, literal escapes, no end."""
+    print("model output parsing")
+    from backend.llm import _extract_json
+
+    check(
+        "reads a plain object",
+        (_extract_json('{"cleaned": "I downloaded the file"}') or {}).get("cleaned")
+        == "I downloaded the file",
+    )
+    check(
+        "reads a fenced object",
+        (_extract_json('```json\n{"cleaned": "spelling error"}\n```') or {}).get("cleaned")
+        == "spelling error",
+    )
+    # The model copied the article's own quotation mark as the JSON delimiter.
+    check(
+        "accepts a curly closing quote",
+        (_extract_json('{"cleaned": "நன்றி கூறியுள்ளனர்.”}') or {}).get("cleaned") == "நன்றி கூறியுள்ளனர்.",
+    )
+    # finish_reason=stop, but the string was never closed.
+    check(
+        "accepts an unterminated value",
+        (_extract_json('```json\n{"cleaned": "வணக்கம் நன்றி') or {}).get("cleaned") == "வணக்கம் நன்றி",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api", action="store_true", help="also test a running server")
@@ -324,6 +384,7 @@ def main() -> int:
 
     check_repairs()
     check_boundaries()
+    check_parser()
     check_job_shape()
     check_roundtrip()
     check_column_guess()

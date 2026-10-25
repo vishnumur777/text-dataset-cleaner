@@ -27,6 +27,8 @@ WS_RE = re.compile(r"[ \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+")
 PUNCT_BEFORE_RE = re.compile(r"\s+([,.;:!?%)\]}\u201d\u2019])")
 PUNCT_AFTER_RE = re.compile(r"([(\[{\u201c\u2018])\s+")
 WORD_RE = re.compile(r"^([\w\u0b80-\u0bff]+)(.*)$", re.UNICODE)
+# A literal two-character escape the model may type into the text ("\n", "\r", "\t").
+ESCAPE_RE = re.compile(r"\\[nrt]")
 
 KEEP_BONUS = 0.4
 MERGE_PENALTY = 1.2
@@ -100,12 +102,20 @@ class BoundaryModel:
     """Lexicon + character n-gram model learned from the user's own column."""
 
     def __init__(self, texts: Iterable[str], use_english: bool = True):
+        texts = [str(t) for t in texts]
         freq: Counter[str] = Counter()
+        # Adjacent-token pairs, used as evidence that a boundary is real: a
+        # non-Latin split is only trusted when the column itself writes the two
+        # parts next to each other somewhere else.
+        pairs: Counter[tuple[str, str]] = Counter()
         for text in texts:
-            for tok in normalize(text).split():
-                core, _ = _split_punct(tok)
-                if core:
-                    freq[core] += 1
+            cores = [_split_punct(tok)[0] for tok in normalize(text).split()]
+            cores = [core for core in cores if core]
+            for core in cores:
+                freq[core] += 1
+            for left, right in zip(cores, cores[1:]):
+                pairs[(left, right)] += 1
+        self.pairs = pairs
         self.freq = freq
         self.total = max(sum(freq.values()), 1)
         self.english = english_words() if use_english else frozenset()
@@ -235,6 +245,10 @@ class BoundaryModel:
         return cost
 
     # ------------------------------------------------------------------ splits
+    def _pair_evidence(self, parts: list[str]) -> bool:
+        """True when the column uses these parts adjacently as separate tokens."""
+        return all(self.pairs.get((a, b), 0) > 0 for a, b in zip(parts, parts[1:]))
+
     def best_split(self, token: str) -> tuple[list[str], float] | None:
         """Segment a glued token into 2-3 known words, or return None.
 
@@ -274,6 +288,14 @@ class BoundaryModel:
         if best is None:
             return None
         parts = best[1]
+
+        # Non-Latin scripts are agglutinative: a Tamil stem carries its case
+        # endings, so "both halves are known words" is *normal* ("பெண்" + "களின்"
+        # inside "பெண்களின்"), not evidence of a glue error. On a small column that
+        # is exactly what turned a correct "பெண்களின்" into "பெண் களின்". For those
+        # scripts the column itself has to show the boundary elsewhere.
+        if not _is_latin(token) and not self._pair_evidence(parts):
+            return None
 
         # A split needs evidence. Either a part also appears as its own token
         # somewhere in this dataset, or the token is rare and long enough that
@@ -479,7 +501,18 @@ def freeze_boundaries(before: str, after: str, known=None) -> tuple[str, int]:
             out.append(old)
             continue
 
-        touches_space = old.strip() != old or new.strip() != new
+        # An escape sequence or a newline the model typed into the text is a
+        # boundary edit in disguise: llama-server can return the two characters
+        # "\n" inside a cell, which would otherwise look like a letter insertion.
+        touches_space = (
+            old.strip() != old
+            or new.strip() != new
+            or "\n" in new
+            or "\t" in new
+            or "\r" in new
+            or ESCAPE_RE.search(new) is not None
+            or ESCAPE_RE.search(old) is not None
+        )
         if touches_space:
             # Only a join the lexicon agrees with is allowed through.
             allow_join = bool(
